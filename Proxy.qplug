@@ -1,0 +1,297 @@
+-- Proxy - a Q-SYS Core plugin to proxy a tcp connection
+-- by Chris Poole
+--
+-- Latest version available from
+-- https://github.com/ninjaoxygen/QsysProxyPlugin
+--
+-- -- License --
+--
+-- The MIT License
+--
+-- Copyright (C) 2019 Chris Poole, AVSP Ltd
+--
+-- Permission is hereby granted, free of charge, to any person obtaining a copy
+-- of this software and associated documentation files (the "Software"), to deal
+-- in the Software without restriction, including without limitation the rights
+-- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-- copies of the Software, and to permit persons to whom the Software is
+-- furnished to do so, subject to the following conditions:
+--
+-- The above copyright notice and this permission notice shall be included in
+-- all copies or substantial portions of the Software.
+--
+-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-- THE SOFTWARE.
+--
+--
+PluginInfo = {
+    Name = "Proxy",
+    Version = "0.16",
+    Id = "67c74ab3-300b-47ac-9868-05bfd154a9bc",
+    Description = "Plugin to proxy a TCP connection, chris@avsp.co.uk",
+    ShowDebug = false
+}
+
+function GetPrettyName(props)
+    return string.format("%s %s", PluginInfo.Name, PluginInfo.Version)
+end
+
+function GetColor(props) return {40, 40, 40} end
+
+function GetProperties()
+    props = {}
+
+    table.insert(props, {
+        Name = "Listen Port",
+        Type = "integer",
+        Min = 0,
+        Max = 65535,
+        Value = 722
+    })
+
+    table.insert(props,
+                 {Name = "Hostname", Type = "string", Value = "localhost"})
+
+    table.insert(props, {
+        Name = "Port",
+        Type = "integer",
+        Min = 0,
+        Max = 65535,
+        Value = 22
+    })
+
+    return props
+end
+
+function GetControls(props)
+    return {
+        {Name = "ClearLog", ControlType = "Text", Count = 1},
+        {Name = "Output", ControlType = "Text", Count = 1}
+    }
+end
+
+function GetControlLayout(props)
+    layout = {}
+
+    layout["ClearLog"] = {
+        Style = "Button",
+        ButtonStyle = "Trigger",
+        Legend = "Clear Log",
+        TextFontSize = 12,
+        IsBold = true,
+        OffColor = {200, 200, 200},
+        UnlinkOffColor = true,
+        Color = {200, 200, 200},
+        Position = {240, 46},
+        Size = {128, 24}
+    }
+    layout["Output"] = {
+        Style = "Textbox",
+        TextFontSize = 12,
+        HTextAlign = "Left",
+        VTextAlign = "Top",
+        Position = {16, 72},
+        Size = {352, 500}
+    }
+    graphics = {
+        {
+            Type = "Text",
+            Text = PluginInfo.Description,
+            TextSize = 14,
+            Position = {0, 0},
+            Size = {384, 38}
+        }, {
+            Type = "GroupBox",
+            Text = "Log",
+            TextSize = 18,
+            HTextAlign = "Left",
+            StrokeWidth = 1,
+            CornerRadius = 8,
+            Fill = {40, 40, 40},
+            Position = {8, 42},
+            Size = {368, 545}
+        }
+    }
+    return layout, graphics
+end
+
+function GetPins(props) return {} end
+
+function GetComponents(props) return {} end
+
+function GetWiring(props) return {} end
+
+if Controls then
+
+    local clearlog = Controls.ClearLog
+    local output = Controls.Output
+
+    statusText = ''
+
+    function AddStatus(message)
+        statusText = statusText .. message .. "\r\n"
+        Controls.Output.String = statusText
+    end
+
+    AddStatus("Lua version " .. _VERSION)
+
+    clearlog.EventHandler = function()
+        statusText = ""
+        Controls.Output.String = statusText
+    end
+
+    -- TODO first packets may be lost from inbound to outbound, we should buffer them in case the outbound takes time
+    -- suspect these are buffered by the runtime... works fine with ssh in which has both ends send immediately
+
+    ProxyServer = {}
+    ProxyServer.__index = ProxyServer
+
+    function ProxyServer:create(localPort, remoteHost, remotePort)
+        AddStatus("creating ProxyServer")
+        local p = {} -- our new object
+        setmetatable(p, ProxyServer) -- make ProxyServer handle lookup
+
+        AddStatus("starting ProxyServer from listen port " .. localPort ..
+                      " to " .. remoteHost .. ":" .. remotePort)
+
+        p.localPort = localPort
+        p.remoteHost = remoteHost
+        p.remotePort = remotePort
+
+        server = TcpSocketServer.New()
+        errorMessage = server:Listen(localPort)
+
+        if (errorMessage) then
+            AddStatus("ProxyServer: listen error: " .. errorMessage)
+            return
+        else
+            AddStatus("ProxyServer: listen successful")
+        end
+
+        server.EventHandler =
+            function(socket) -- the properties of this socket instance are those of the TcpSocket library
+                AddStatus("new connection received, constructing Proxy")
+                proxy = Proxy:create(socket, remoteHost, remotePort)
+            end
+    end
+
+    -- Proxy is a single connection pair
+    Proxy = {}
+    Proxy.__index = Proxy
+
+    function Proxy:create(inbound, remoteHost, remotePort)
+        AddStatus("creating proxy connection pair")
+        local p = {} -- our new object
+        setmetatable(p, Proxy) -- make Proxy handle lookup
+        p.inbound = inbound -- initialize our object
+
+        outbound = TcpSocket.New()
+        outbound.ReconnectTimeout = 0 -- disable automatic reconnect, is 5 by default
+
+        -- inbound already has a valid connection, we can set the outbound's event in advance
+        outbound.EventHandler = function(socket, event)
+            -- AddStatus("<- from outbound")
+            return p:OutboundSocketHandler(socket, event)
+        end
+
+        outbound:Connect(remoteHost, remotePort)
+
+        p.outbound = outbound
+
+        -- only set the inbound's event now we have an outbound that (should) be connected
+        p.inbound.EventHandler = function(socket, event)
+            -- AddStatus("-> from inbound")
+            return p:InboundSocketHandler(socket, event)
+        end
+
+        AddStatus("Proxy:create complete")
+
+        if outbound.IsConnected then
+            AddStatus("outbound is connected")
+        else
+            AddStatus("outbound not connected")
+        end
+
+        return p
+    end
+
+    function Proxy:InboundSocketHandler(socket, event)
+        if event == TcpSocket.Events.Data then
+            data = socket:Read(socket.BufferLength)
+            if (self.outbound.IsConnected) then
+                self.outbound:Write(data)
+            end
+        else
+            AddStatus("inbound: event " .. event)
+            if (not self.inbound.IsConnected) then self:Disconnect() end
+        end
+    end
+
+    function Proxy:OutboundSocketHandler(socket, event)
+        if event == TcpSocket.Events.Data then
+            data = socket:Read(socket.BufferLength)
+            if (self.inbound.IsConnected) then
+                self.inbound:Write(data)
+            end
+        else
+            AddStatus("outbound: event " .. event)
+            if (not self.outbound.IsConnected) then self:Disconnect() end
+        end
+    end
+
+    -- release references and EventHandlers to allow gc
+    function Proxy:Disconnect()
+        if (self.outbound ~= nil and self.outbound.IsConnected) then
+            self.outbound:Disconnect()
+        end
+
+        if (self.inbound ~= nil and self.inbound.IsConnected) then
+            self.inbound:Disconnect()
+        end
+
+        if (self.outbound ~= nil) then self.outbound.EventHandler = nil end
+
+        if (self.inbound ~= nil) then self.inbound.EventHandler = nil end
+
+        self.outbound = nil
+
+        self.inbound = nil
+    end
+
+    function dump(o)
+        if type(o) == 'table' then
+            local s = '{ '
+            for k, v in pairs(o) do
+                if type(k) ~= 'number' then k = '"' .. k .. '"' end
+                s = s .. '[' .. k .. '] = ' .. dump(v) .. ','
+            end
+            return s .. '} '
+        else
+            return tostring(o)
+        end
+    end
+
+    function init()
+        local listenPort = Properties["Listen Port"].Value
+        local targetIp = Properties["Hostname"].Value
+        local targetPort = Properties["Port"].Value
+        local proxyserver = ProxyServer:create(listenPort, targetIp, targetPort)
+
+        AddStatus(dump(_))
+        AddStatus(dump(Qlib))
+    end
+
+    init()
+
+    -- TODO put some error message reporting in
+    -- socket.Error = function(sock, err)
+    --  AddStatus("Outbound TCP socket had an error and will now close",err)
+    --  socket:Disconnect() -- prevent further attempts to connect
+    -- end
+
+end
